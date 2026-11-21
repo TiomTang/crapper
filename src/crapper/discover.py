@@ -20,6 +20,7 @@ EXTENSIONS = {
     ".cjs": "typescript",
     ".rs": "rust",
     ".py": "python",
+    ".cs": "csharp",
 }
 
 SKIP_DIRS = {
@@ -27,6 +28,7 @@ SKIP_DIRS = {
     ".hg",
     ".svn",
     ".idea",
+    ".vs",
     ".venv",
     "venv",
     "node_modules",
@@ -35,6 +37,9 @@ SKIP_DIRS = {
     "dist",
     "build",
     "out",
+    "bin",
+    "obj",
+    "TestResults",
     "coverage",
     ".metrics",
     "testdata",
@@ -42,7 +47,11 @@ SKIP_DIRS = {
     ".clj-kondo",
 }
 
+_SKIP_LOWER = {name.lower() for name in SKIP_DIRS}
+
 TEST_DIRS = {"test", "tests", "spec", "specs", "__tests__"}
+
+CSHARP_TEST_SUFFIXES = ("Tests.cs", "Test.cs")
 
 GO_TEST_SUFFIX = "_test.go"
 CLOJURE_TEST_SUFFIXES = ("_test.clj", "_test.cljc", "_test.cljs", "_test.bb")
@@ -71,6 +80,8 @@ def language_of(path: str | Path) -> str | None:
     name = file_path.name
     if name.endswith(".d.ts"):
         return None
+    if name.endswith(".g.cs") or name.endswith(".Designer.cs"):
+        return None
     return EXTENSIONS.get(file_path.suffix)
 
 
@@ -83,11 +94,13 @@ def is_test_file(path: str | Path) -> bool:
         return True
     if name.endswith(JS_TEST_SUFFIXES):
         return True
+    if name.endswith(CSHARP_TEST_SUFFIXES):
+        return True
     if name == "conftest.py":
         return True
     if name.endswith("_test.py") or (name.startswith("test_") and name.endswith(".py")):
         return True
-    return any(part in TEST_DIRS for part in file_path.parts)
+    return any(part.lower() in TEST_DIRS for part in file_path.parts)
 
 
 def _walk(root: Path) -> list[Path]:
@@ -98,7 +111,9 @@ def _walk(root: Path) -> list[Path]:
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
-            name for name in dirnames if name not in SKIP_DIRS and name not in TEST_DIRS
+            name
+            for name in dirnames
+            if name.lower() not in _SKIP_LOWER and name.lower() not in TEST_DIRS
         ]
         for name in filenames:
             path = Path(dirpath) / name

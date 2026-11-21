@@ -438,10 +438,103 @@ def parse_jacoco_index(text: str) -> dict[str, list[JacocoMethod]]:
 
 
 @dataclass
+class CoberturaMethod:
+    covered: int
+    total: int
+    line: int
+
+    @property
+    def percent(self) -> float:
+        return coverage_percent(self.covered, self.total)
+
+
+def _int_attr(node, name: str) -> int:
+    try:
+        return int(node.get(name) or "0")
+    except ValueError:
+        return 0
+
+
+def _line_hits(lines_node) -> dict[int, tuple[int, int]]:
+    hits: dict[int, tuple[int, int]] = {}
+    for line in lines_node:
+        if line.tag != "line":
+            continue
+        number = _int_attr(line, "number")
+        if number <= 0:
+            continue
+        covered, total = hits.get(number, (0, 0))
+        hits[number] = (covered + (1 if _int_attr(line, "hits") > 0 else 0), total + 1)
+    return hits
+
+
+def _cobertura_method(method) -> CoberturaMethod | None:
+    lines: dict[int, tuple[int, int]] = {}
+    for child in method:
+        if child.tag == "lines":
+            lines.update(_line_hits(child))
+    if not lines:
+        return None
+    covered = sum(1 for covered_hits, _total in lines.values() if covered_hits)
+    return CoberturaMethod(covered=covered, total=len(lines), line=min(lines))
+
+
+def cobertura_class_names(name: str) -> list[str]:
+    """The spellings a report may use for one type: `A.B.C`, `A.B/C`, `A.B+C`."""
+
+    dotted = name.replace("/", ".").replace("+", ".")
+    names: list[str] = []
+    for candidate in (name, dotted):
+        if candidate and candidate not in names:
+            names.append(candidate)
+    return names
+
+
+def _cobertura_from_index(classes, class_names, method_name, line) -> float | None:
+    pool: list[CoberturaMethod] = []
+    for name in class_names:
+        pool.extend(classes.get(f"{name}#{method_name}", []))
+    if not pool:
+        return None
+    for method in pool:
+        if method.line == line:
+            return method.percent
+    nearest = min(pool, key=lambda method: abs(method.line - line))
+    return nearest.percent
+
+
+def parse_cobertura(
+    text: str,
+) -> tuple[dict[str, list[CoberturaMethod]], dict[str, dict[int, tuple[int, int]]]]:
+    """Method index (`class#method`) and class-level line maps from Cobertura XML.
+
+    coverlet writes a class name with dots, and a nested type as
+    `Demo.Outer/Inner`. Both spellings are indexed so the lookup finds either.
+    """
+
+    cleaned = _DOCTYPE.sub("", text)
+    root = ET.fromstring(cleaned)
+    methods: dict[str, list[CoberturaMethod]] = {}
+    lines: dict[str, dict[int, tuple[int, int]]] = {}
+    for class_node in root.iter("class"):
+        for name in cobertura_class_names(class_node.get("name", "")):
+            for method in class_node.iter("method"):
+                found = _cobertura_method(method)
+                if found is not None:
+                    methods.setdefault(f"{name}#{method.get('name', '')}", []).append(found)
+            for child in class_node:
+                if child.tag == "lines":
+                    lines.setdefault(name, _line_hits(child))
+    return methods, lines
+
+
+@dataclass
 class CoverageBundle:
     lcov: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
     go_profile: dict[str, list[tuple[int, int, int, int]]] | None = None
     jacoco: dict[str, list[JacocoMethod]] | None = None
+    cobertura: dict[str, list[CoberturaMethod]] | None = None
+    cobertura_class: dict[str, dict[int, tuple[int, int]]] | None = None
     form_html: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
     source_parts: list[tuple[str, ...]] = field(default_factory=list)
     root: Path | None = None
@@ -469,6 +562,18 @@ class CoverageBundle:
             return _jacoco_from_index(
                 self.jacoco or {}, names, function.name, function.start_line
             )
+        if function.language == "csharp":
+            names = cobertura_class_names(function.namespace)
+            found = _cobertura_from_index(
+                self.cobertura or {}, names, function.name, function.start_line
+            )
+            if found is not None:
+                return found
+            for name in names:
+                lines = (self.cobertura_class or {}).get(name)
+                if lines:
+                    return percent_for_range(lines, function.start_line, function.end_line)
+            return None
         if function.language == "go":
             segments = self._go_segments(function.path)
             return _segments_percent(segments, function.start_line, function.end_line)
@@ -584,13 +689,37 @@ def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
     return found
 
 
+def _cobertura_paths(root: Path) -> list[Path]:
+    paths = list(root.glob("target/coverage/csharp/**/*.xml"))
+    paths.extend(root.glob("**/TestResults/**/coverage.cobertura.xml"))
+    paths.append(root / "coverage.cobertura.xml")
+    return paths
+
+
+def _merge_cobertura(
+    root: Path,
+) -> tuple[dict[str, list[CoberturaMethod]], dict[str, dict[int, tuple[int, int]]]]:
+    methods: dict[str, list[CoberturaMethod]] = {}
+    lines: dict[str, dict[int, tuple[int, int]]] = {}
+    for text in _merge_texts(_cobertura_paths(root)):
+        found_methods, found_lines = parse_cobertura(text)
+        for key, values in found_methods.items():
+            methods.setdefault(key, []).extend(values)
+        for key, value in found_lines.items():
+            lines.setdefault(key, {}).update(value)
+    return methods, lines
+
+
 def load_bundle(root: Path) -> CoverageBundle:
     go_profile = _merge_go(root)
     jacoco = _merge_jacoco(root)
+    cobertura, cobertura_class = _merge_cobertura(root)
     return CoverageBundle(
         lcov=_merge_lcov(root),
         go_profile=go_profile or None,
         jacoco=jacoco or None,
+        cobertura=cobertura or None,
+        cobertura_class=cobertura_class or None,
         form_html=_merge_forms(root),
         root=root,
     )

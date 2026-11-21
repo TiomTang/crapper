@@ -70,7 +70,7 @@ def _clean_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
-_COVERAGE_DIRS = {"typescript", "rust", "go", "python"}
+_COVERAGE_DIRS = {"typescript", "rust", "go", "python", "csharp"}
 
 
 def _outside_language_dirs(coverage: Path, path: Path) -> bool:
@@ -407,6 +407,112 @@ def rust_coverage_command(kind: str, report: Path) -> list[str]:
     return ["cargo", "tarpaulin", "--out", "Lcov", "--output-dir", str(report.parent)]
 
 
+_CSHARP_SOLUTIONS = ("*.sln", "*.slnx")
+_CSHARP_COLLECT = "--collect:XPlat Code Coverage"
+_CSHARP_TEST_MARKERS = ("Microsoft.NET.Test.Sdk", "<IsTestProject>true")
+
+
+def _nearest_glob(start: Path, pattern: str, stop: Path) -> Path | None:
+    """The nearest ancestor of `start` that holds a file matching `pattern`."""
+
+    current = start if start.is_dir() else start.parent
+    stop = stop.resolve()
+    while True:
+        for candidate in sorted(current.glob(pattern)):
+            if candidate.is_file():
+                return candidate
+        if current == stop or current.parent == current:
+            return None
+        current = current.parent
+
+
+def is_test_project(project: Path) -> bool:
+    if project.stem.endswith(("Tests", "Test")):
+        return True
+    text = project.read_text(encoding="utf-8", errors="replace")
+    return any(marker in text for marker in _CSHARP_TEST_MARKERS)
+
+
+def _nearest_test_project(start: Path, stop: Path) -> Path | None:
+    current = start if start.is_dir() else start.parent
+    stop = stop.resolve()
+    while True:
+        for candidate in sorted(current.glob("*.csproj")):
+            if candidate.is_file() and is_test_project(candidate):
+                return candidate
+        if current == stop or current.parent == current:
+            return None
+        current = current.parent
+
+
+def csharp_targets(root: Path, files: list[Path]) -> list[Path]:
+    """The solution, else the test project, above each C# file."""
+
+    targets: set[Path] = set()
+    root = root.resolve()
+    for file in files:
+        if language_of(file) != "csharp":
+            continue
+        found = None
+        for pattern in _CSHARP_SOLUTIONS:
+            found = _nearest_glob(Path(file), pattern, root)
+            if found is not None:
+                break
+        if found is None:
+            found = _nearest_test_project(Path(file), root)
+        if found is not None:
+            targets.add(found.resolve())
+    return sorted(targets)
+
+
+def csharp_command(target: Path, report_dir: Path) -> list[str]:
+    return [
+        "dotnet",
+        "test",
+        str(target),
+        _CSHARP_COLLECT,
+        "--results-directory",
+        str(report_dir),
+    ]
+
+
+def _uses_coverlet(directory: Path) -> bool:
+    """Does any project under `directory` reference coverlet?"""
+
+    for project in directory.rglob("*.csproj"):
+        if "bin" in project.parts or "obj" in project.parts:
+            continue
+        text = project.read_text(encoding="utf-8", errors="replace")
+        if "coverlet" in text.lower():
+            return True
+    return False
+
+
+def _cover_csharp(root: Path, files: list[Path]) -> None:
+    if shutil.which("dotnet") is None:
+        _warn("dotnet is not on PATH; skipping C# coverage.")
+        return
+    targets = csharp_targets(root, files)
+    if not targets:
+        _warn("No .sln or test project above the C# files; skipping C# coverage.")
+        return
+    for target in targets:
+        directory = target.parent
+        report = _coverage_report(root, directory, "csharp")
+        report.parent.mkdir(parents=True, exist_ok=True)
+        for stale in report.parent.glob("**/coverage.cobertura.xml"):
+            stale.unlink()
+        if not _uses_coverlet(directory):
+            _warn(
+                f"No coverlet reference in {directory}. "
+                "Add `dotnet add package coverlet.collector` to the test project "
+                "so `dotnet test` writes Cobertura."
+            )
+        code = run_shell(csharp_command(target, report.parent), directory)
+        if code != 0:
+            _warn(f"C# coverage exited {code} in {directory}. C# coverage will score 0%.")
+
+
 def _languages_in(files: list[Path]) -> set[str]:
     found = set()
     for file in files:
@@ -593,4 +699,6 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
         _cover_python(root, files)
     if "rust" in languages:
         _cover_rust(root, files)
+    if "csharp" in languages:
+        _cover_csharp(root, files)
     return 0
