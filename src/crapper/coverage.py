@@ -439,9 +439,19 @@ def parse_jacoco_index(text: str) -> dict[str, list[JacocoMethod]]:
 
 @dataclass
 class CoberturaMethod:
-    covered: int
-    total: int
+    """One method's covered lines. `hit` keeps per-line flags so several runs merge."""
+
+    hit: dict[int, int]
     line: int
+    path: str = ""
+
+    @property
+    def covered(self) -> int:
+        return sum(1 for value in self.hit.values() if value)
+
+    @property
+    def total(self) -> int:
+        return len(self.hit)
 
     @property
     def percent(self) -> float:
@@ -468,15 +478,15 @@ def _line_hits(lines_node) -> dict[int, tuple[int, int]]:
     return hits
 
 
-def _cobertura_method(method) -> CoberturaMethod | None:
-    lines: dict[int, tuple[int, int]] = {}
+def _cobertura_method(method, path: str = "") -> CoberturaMethod | None:
+    hit: dict[int, int] = {}
     for child in method:
         if child.tag == "lines":
-            lines.update(_line_hits(child))
-    if not lines:
+            for line, (covered, _total) in _line_hits(child).items():
+                hit[line] = max(hit.get(line, 0), covered)
+    if not hit:
         return None
-    covered = sum(1 for covered_hits, _total in lines.values() if covered_hits)
-    return CoberturaMethod(covered=covered, total=len(lines), line=min(lines))
+    return CoberturaMethod(hit=hit, line=min(hit), path=path)
 
 
 def cobertura_class_names(name: str) -> list[str]:
@@ -490,12 +500,17 @@ def cobertura_class_names(name: str) -> list[str]:
     return names
 
 
-def _cobertura_from_index(classes, class_names, method_name, line) -> float | None:
+def _cobertura_from_index(classes, class_names, method_name, line, source_path: str = "") -> float | None:
     pool: list[CoberturaMethod] = []
     for name in class_names:
         pool.extend(classes.get(f"{name}#{method_name}", []))
     if not pool:
         return None
+    if len(pool) > 1 and source_path:
+        # 同名同命名空间的类在两个工程里各有一份时，用报告里的文件名分辨
+        matched = [method for method in pool if suffix_match(method.path, source_path)]
+        if matched:
+            pool = matched
     for method in pool:
         if method.line == line:
             return method.percent
@@ -519,7 +534,7 @@ def parse_cobertura(
     for class_node in root.iter("class"):
         for name in cobertura_class_names(class_node.get("name", "")):
             for method in class_node.iter("method"):
-                found = _cobertura_method(method)
+                found = _cobertura_method(method, class_node.get("filename", ""))
                 if found is not None:
                     methods.setdefault(f"{name}#{method.get('name', '')}", []).append(found)
             for child in class_node:
@@ -565,7 +580,7 @@ class CoverageBundle:
         if function.language == "csharp":
             names = cobertura_class_names(function.namespace)
             found = _cobertura_from_index(
-                self.cobertura or {}, names, function.name, function.start_line
+                self.cobertura or {}, names, function.name, function.start_line, function.path
             )
             if found is not None:
                 return found
@@ -699,14 +714,29 @@ def _cobertura_paths(root: Path) -> list[Path]:
 def _merge_cobertura(
     root: Path,
 ) -> tuple[dict[str, list[CoberturaMethod]], dict[str, dict[int, tuple[int, int]]]]:
-    methods: dict[str, list[CoberturaMethod]] = {}
+    """Union the reports of every test run: a line counts once however many runs saw it."""
+
+    hits: dict[str, dict[int, int]] = {}
     lines: dict[str, dict[int, tuple[int, int]]] = {}
     for text in _merge_texts(_cobertura_paths(root)):
         found_methods, found_lines = parse_cobertura(text)
         for key, values in found_methods.items():
-            methods.setdefault(key, []).extend(values)
+            for value in values:
+                parts = _segments(value.path)
+                target = hits.setdefault(f"{key}@{(parts[-1] if parts else '')}", {})
+                for line, hit in value.hit.items():
+                    target[line] = max(target.get(line, 0), hit)
         for key, value in found_lines.items():
-            lines.setdefault(key, {}).update(value)
+            target_lines = lines.setdefault(key, {})
+            for line, (covered, total) in value.items():
+                old = target_lines.get(line, (0, 0))
+                target_lines[line] = (max(old[0], covered), max(old[1], total))
+    methods: dict[str, list[CoberturaMethod]] = {}
+    for key, hit in hits.items():
+        if not hit:
+            continue
+        original, _, name = key.rpartition("@")
+        methods.setdefault(original, []).append(CoberturaMethod(hit=hit, line=min(hit), path=name))
     return methods, lines
 
 

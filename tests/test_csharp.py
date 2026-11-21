@@ -187,3 +187,66 @@ def test_a_method_missing_from_the_report_falls_back_to_its_class_lines():
     bundle = CoverageBundle(cobertura=methods, cobertura_class=lines)
     assert bundle.percent_for(unit("Untold", "Demo.Core.Board", 6, 8)) == 100.0
     assert bundle.percent_for(unit("Elsewhere", "Other.Type", 1, 2)) is None
+
+
+def _write_run(root, run, hits):
+    report = root / "target/coverage/csharp" / run / "coverage.cobertura.xml"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        COBERTURA.replace('<line number="6" hits="1"/>', f'<line number="6" hits="{hits}"/>', 1),
+        encoding="utf-8",
+    )
+
+
+def test_two_test_runs_merge_instead_of_competing(tmp_path):
+    from crapper.coverage import _merge_cobertura
+
+    _write_run(tmp_path, "run-a", 0)
+    _write_run(tmp_path, "run-b", 4)
+
+    methods, lines = _merge_cobertura(tmp_path)
+
+    merged = methods["Demo.Core.Board#Place"][0]
+    assert merged.covered == 3
+    assert merged.total == 4
+    assert merged.percent == 75.0
+    assert lines["Demo.Core.Board"][6][0] == 1
+
+
+TWO_COPIES = """<?xml version="1.0" encoding="utf-8"?>
+<coverage line-rate="0.5" version="1.9">
+  <packages>
+    <package name="EmpyrionMod">
+      <classes>
+        <class name="EmpyrionMod.Helpers.Copier" filename="EmpyrionMod/Helpers/Copier.cs">
+          <methods>
+            <method name="Copy" line-rate="0">
+              <lines><line number="9" hits="0"/></lines>
+            </method>
+          </methods>
+          <lines><line number="9" hits="0"/></lines>
+        </class>
+        <class name="EmpyrionMod.Helpers.Copier" filename="ScenarioPatcherTool/Copier.cs">
+          <methods>
+            <method name="Copy" line-rate="1">
+              <lines><line number="9" hits="5"/></lines>
+            </method>
+          </methods>
+          <lines><line number="9" hits="5"/></lines>
+        </class>
+      </classes>
+    </package>
+  </packages>
+</coverage>
+"""
+
+
+def test_a_duplicated_class_is_scored_from_its_own_file():
+    methods, _lines = parse_cobertura(TWO_COPIES)
+    bundle = CoverageBundle(cobertura=methods)
+
+    in_mod = unit("Copy", "EmpyrionMod.Helpers.Copier", 9, path="EmpyrionMod/Helpers/Copier.cs")
+    in_tool = unit("Copy", "EmpyrionMod.Helpers.Copier", 9, path="ScenarioPatcherTool/Copier.cs")
+
+    assert bundle.percent_for(in_mod) == 0.0
+    assert bundle.percent_for(in_tool) == 100.0
