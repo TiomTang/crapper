@@ -543,6 +543,31 @@ def parse_cobertura(
     return methods, lines
 
 
+def parse_cobertura_files(text: str) -> dict[str, dict[int, tuple[int, int]]]:
+    """Per-file line hits from Cobertura XML, keyed by the report's `filename`.
+
+    A file holds several classes (partial classes, nested types), so the same
+    line can appear more than once. Union them: mutator asks "was this line
+    executed", not "how many classes covered it".
+    """
+
+    cleaned = _DOCTYPE.sub("", text)
+    root = ET.fromstring(cleaned)
+    files: dict[str, dict[int, tuple[int, int]]] = {}
+    for class_node in root.iter("class"):
+        name = class_node.get("filename", "")
+        if not name:
+            continue
+        for child in class_node:
+            if child.tag != "lines":
+                continue
+            found = files.setdefault(name, {})
+            for line, (covered, total) in _line_hits(child).items():
+                old = found.get(line, (0, 0))
+                found[line] = (max(old[0], covered), max(old[1], total))
+    return files
+
+
 @dataclass
 class CoverageBundle:
     lcov: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
@@ -550,6 +575,8 @@ class CoverageBundle:
     jacoco: dict[str, list[JacocoMethod]] | None = None
     cobertura: dict[str, list[CoberturaMethod]] | None = None
     cobertura_class: dict[str, dict[int, tuple[int, int]]] | None = None
+    # Line hits keyed by the report's file name, for tools that work per file.
+    cobertura_file: dict[str, dict[int, tuple[int, int]]] | None = None
     form_html: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
     source_parts: list[tuple[str, ...]] = field(default_factory=list)
     root: Path | None = None
@@ -616,6 +643,18 @@ class CoverageBundle:
 
     def _html_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.form_html, path, self.source_parts)
+
+    def csharp_lines(self, path: str) -> set[int] | None:
+        """Lines a Cobertura report marks as hit for one C# file.
+
+        None means the file is absent from every report, which callers must tell
+        apart from "the file has no covered line".
+        """
+
+        record = _lookup(self.cobertura_file or {}, path, self.source_parts)
+        if record is None:
+            return None
+        return {line for line, (covered, _total) in record.items() if covered}
 
     def _lcov_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.lcov, path, self.source_parts)
@@ -713,11 +752,12 @@ def _cobertura_paths(root: Path) -> list[Path]:
 
 def _merge_cobertura(
     root: Path,
-) -> tuple[dict[str, list[CoberturaMethod]], dict[str, dict[int, tuple[int, int]]]]:
+) -> tuple[dict[str, list[CoberturaMethod]], dict[str, dict[int, tuple[int, int]]], dict[str, dict[int, tuple[int, int]]]]:
     """Union the reports of every test run: a line counts once however many runs saw it."""
 
     hits: dict[str, dict[int, int]] = {}
     lines: dict[str, dict[int, tuple[int, int]]] = {}
+    files: dict[str, dict[int, tuple[int, int]]] = {}
     for text in _merge_texts(_cobertura_paths(root)):
         found_methods, found_lines = parse_cobertura(text)
         for key, values in found_methods.items():
@@ -731,25 +771,31 @@ def _merge_cobertura(
             for line, (covered, total) in value.items():
                 old = target_lines.get(line, (0, 0))
                 target_lines[line] = (max(old[0], covered), max(old[1], total))
+        for name, value in parse_cobertura_files(text).items():
+            target_file = files.setdefault(name, {})
+            for line, (covered, total) in value.items():
+                old = target_file.get(line, (0, 0))
+                target_file[line] = (max(old[0], covered), max(old[1], total))
     methods: dict[str, list[CoberturaMethod]] = {}
     for key, hit in hits.items():
         if not hit:
             continue
         original, _, name = key.rpartition("@")
         methods.setdefault(original, []).append(CoberturaMethod(hit=hit, line=min(hit), path=name))
-    return methods, lines
+    return methods, lines, files
 
 
 def load_bundle(root: Path) -> CoverageBundle:
     go_profile = _merge_go(root)
     jacoco = _merge_jacoco(root)
-    cobertura, cobertura_class = _merge_cobertura(root)
+    cobertura, cobertura_class, cobertura_file = _merge_cobertura(root)
     return CoverageBundle(
         lcov=_merge_lcov(root),
         go_profile=go_profile or None,
         jacoco=jacoco or None,
         cobertura=cobertura or None,
         cobertura_class=cobertura_class or None,
+        cobertura_file=cobertura_file or None,
         form_html=_merge_forms(root),
         root=root,
     )

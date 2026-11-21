@@ -204,13 +204,29 @@ def test_two_test_runs_merge_instead_of_competing(tmp_path):
     _write_run(tmp_path, "run-a", 0)
     _write_run(tmp_path, "run-b", 4)
 
-    methods, lines = _merge_cobertura(tmp_path)
+    methods, lines, files = _merge_cobertura(tmp_path)
 
     merged = methods["Demo.Core.Board#Place"][0]
     assert merged.covered == 3
     assert merged.total == 4
     assert merged.percent == 75.0
     assert lines["Demo.Core.Board"][6][0] == 1
+    # 同一行在一次运行里命中就算命中：后者不能把前者的 0% 再叠上来
+    assert files["Board.cs"][6][0] == 1
+    assert files["Board.cs"][9][0] == 0
+
+
+def test_per_file_lines_answer_the_mutator_question(tmp_path):
+    """mutator 要按文件问「这行执行过没有」，不是按类名。"""
+
+    from crapper.coverage import load_bundle
+
+    _write_run(tmp_path, "run-a", 1)
+    bundle = load_bundle(tmp_path)
+
+    assert bundle.csharp_lines("Board.cs") == {6, 7, 8}
+    assert bundle.csharp_lines("./src/Board.cs") == {6, 7, 8}
+    assert bundle.csharp_lines("Missing.cs") is None
 
 
 TWO_COPIES = """<?xml version="1.0" encoding="utf-8"?>
