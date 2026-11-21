@@ -229,6 +229,18 @@ def test_per_file_lines_answer_the_mutator_question(tmp_path):
     assert bundle.csharp_lines("Missing.cs") is None
 
 
+def test_an_absolute_path_finds_the_relative_report_name(tmp_path):
+    """Cobertura 写的是相对工程根的 filename，调用方手里是绝对路径。"""
+
+    from crapper.coverage import load_bundle
+
+    _write_run(tmp_path, "run-a", 1)
+    bundle = load_bundle(tmp_path)
+
+    assert bundle.csharp_lines(str(tmp_path / "Board.cs")) == {6, 7, 8}
+    assert bundle.csharp_lines(str(tmp_path / "nested" / "Missing.cs")) is None
+
+
 TWO_COPIES = """<?xml version="1.0" encoding="utf-8"?>
 <coverage line-rate="0.5" version="1.9">
   <packages>

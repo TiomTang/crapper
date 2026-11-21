@@ -651,10 +651,25 @@ class CoverageBundle:
         apart from "the file has no covered line".
         """
 
-        record = _lookup(self.cobertura_file or {}, path, self.source_parts)
+        index = self.cobertura_file or {}
+        record = _lookup(index, path, self.source_parts)
+        if record is None:
+            # A Cobertura filename is relative to the project the test ran in,
+            # and a caller usually holds an absolute path. Retry in that form.
+            record = _lookup(index, self._project_path(path), self.source_parts)
         if record is None:
             return None
         return {line for line, (covered, _total) in record.items() if covered}
+
+    def _project_path(self, path: str) -> str:
+        """`path` relative to the project root, or unchanged when it is outside."""
+
+        if self.root is None:
+            return path
+        try:
+            return Path(path).resolve().relative_to(self.root.resolve()).as_posix()
+        except (OSError, ValueError):
+            return path
 
     def _lcov_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.lcov, path, self.source_parts)
